@@ -578,59 +578,23 @@ function loadLocal(){
 }
 
 /* ══ SUPABASE: BUDGETS ══ */
+/* fetchBudgets kept for compatibility but boot now fetches inline */
 async function fetchBudgets(){
   const{data,error}=await sb.from('budgets').select('*').order('year').order('month');
   if(error){console.warn('fetchBudgets',error);return null}
-  return data.map(b=>({
-    id:b.id,
-    name:b.name,
-    month:b.month,
-    year:b.year,
-    limit:b.limit||800,
-    lloyds:{start:b.lloyds_start||'',end:b.lloyds_end||''},
-    amex:{start:b.amex_start||'',end:b.amex_end||''},
-    _dbId:b.id, // uuid from supabase
-  }));
-}
-
-async function upsertBudget(b){
-  // b has local numeric id; use name+month+year as upsert key via select first
-  setSyncState('syncing');
-  const payload={
-    name:b.name,month:b.month,year:b.year,
-    limit:b.limit||state.defaultLimit,
-    lloyds_start:b.lloyds.start||null,
-    lloyds_end:b.lloyds.end||null,
-    amex_start:b.amex.start||null,
-    amex_end:b.amex.end||null,
-  };
-  // check if already exists by name
-  const{data:existing}=await sb.from('budgets').select('id').eq('name',b.name).maybeSingle();
-  let dbId=b._dbId;
-  if(existing){
-    const{error}=await sb.from('budgets').update(payload).eq('id',existing.id);
-    if(error){console.warn('upsertBudget update',error);setSyncState('error');return null}
-    dbId=existing.id;
-  }else{
-    const{data,error}=await sb.from('budgets').insert(payload).select('id').single();
-    if(error){console.warn('upsertBudget insert',error);setSyncState('error');return null}
-    dbId=data.id;
-  }
-  setSyncState('ok');
-  return dbId;
+  return data.map(dbRowToBudget);
 }
 
 async function updateBudget(b){
+  // b.id is the supabase uuid
   setSyncState('syncing');
-  const{data:existing}=await sb.from('budgets').select('id').eq('name',b.name).maybeSingle();
-  if(!existing){setSyncState('error');return}
   const{error}=await sb.from('budgets').update({
     limit:b.limit||state.defaultLimit,
     lloyds_start:b.lloyds.start||null,
     lloyds_end:b.lloyds.end||null,
     amex_start:b.amex.start||null,
     amex_end:b.amex.end||null,
-  }).eq('id',existing.id);
+  }).eq('id',b.id);
   if(error){console.warn('updateBudget',error);setSyncState('error')}
   else setSyncState('ok');
 }
@@ -640,8 +604,7 @@ async function fetchTransactions(){
   const{data,error}=await sb.from('transactions').select('*').order('date_str',{ascending:false});
   if(error){console.warn('fetchTransactions',error);return null}
   return data.map(t=>({
-    id:t.id,         // use supabase uuid as id
-    _dbId:t.id,
+    id:t.id,
     budgetId:t.budget_id,
     vendor:t.vendor||'',
     name:t.description||'',
@@ -680,31 +643,46 @@ async function updateTransaction(tx){
     pay:tx.pay,
     flag_label:tx.flagLabel||null,
     date_str:tx.dateStr||null,
-  }).eq('id',tx._dbId||tx.id);
+  }).eq('id',tx.id);
   if(error){console.warn('updateTransaction',error);setSyncState('error')}
   else setSyncState('ok');
 }
 
 async function deleteTransaction(tx){
   setSyncState('syncing');
-  const{error}=await sb.from('transactions').delete().eq('id',tx._dbId||tx.id);
+  const{error}=await sb.from('transactions').delete().eq('id',tx.id);
   if(error){console.warn('deleteTransaction',error);setSyncState('error')}
   else setSyncState('ok');
 }
 
 /* ══ AUTO-BUDGET ══ */
+/* All IDs are Supabase UUIDs — no local numeric IDs */
 function isoDate(y,m,d){return y+'-'+String(m).padStart(2,'0')+'-'+String(d).padStart(2,'0')}
 
-function makeBudgetObj(month,year){
+function makeBudgetPayload(month,year){
   const mIdx=MONTHS.indexOf(month);
   const prevYear=mIdx===0?year-1:year;
   const prevM=mIdx===0?12:mIdx;
   return{
-    id:Date.now()+Math.floor(Math.random()*9999),
     name:month+' '+year,month,year,
     limit:state.defaultLimit,
-    lloyds:{start:isoDate(prevYear,prevM,8),end:isoDate(year,mIdx+1,7)},
-    amex:{start:isoDate(prevYear,prevM,8),end:isoDate(year,mIdx+1,7)},
+    lloyds_start:isoDate(prevYear,prevM,8),
+    lloyds_end:isoDate(year,mIdx+1,7),
+    amex_start:isoDate(prevYear,prevM,8),
+    amex_end:isoDate(year,mIdx+1,7),
+  };
+}
+
+/* convert a db row into a local budget object (id = supabase uuid) */
+function dbRowToBudget(row){
+  return{
+    id:row.id,           // supabase uuid — used everywhere as THE id
+    name:row.name,
+    month:row.month,
+    year:row.year,
+    limit:row.limit||800,
+    lloyds:{start:row.lloyds_start||'',end:row.lloyds_end||''},
+    amex:{start:row.amex_start||'',end:row.amex_end||''},
   };
 }
 
@@ -715,15 +693,18 @@ async function ensureBudgets(){
     const d=new Date(now.getFullYear(),now.getMonth()+off,1);
     const m=MONTHS[d.getMonth()],y=d.getFullYear();
     if(!state.budgets.some(b=>b.month===m&&b.year===y)){
-      const b=makeBudgetObj(m,y);
-      state.budgets.push(b);
+      // insert into supabase, get back the uuid
+      const payload=makeBudgetPayload(m,y);
+      setSyncState('syncing');
+      const{data,error}=await sb.from('budgets').insert(payload).select('*').single();
+      if(error){console.warn('ensureBudgets insert',error);setSyncState('error');continue;}
+      setSyncState('ok');
+      state.budgets.push(dbRowToBudget(data));
       changed=true;
-      // push to supabase, store returned uuid
-      const dbId=await upsertBudget(b);
-      if(dbId)b._dbId=dbId;
     }
   }
   state.budgets.sort((a,b)=>a.year!==b.year?a.year-b.year:MONTHS.indexOf(a.month)-MONTHS.indexOf(b.month));
+  // validate activeBudgetId
   const valid=state.budgets.find(b=>b.id===state.activeBudgetId);
   if(!valid){
     const now2=new Date();
@@ -734,46 +715,44 @@ async function ensureBudgets(){
   if(changed)saveLocal();
 }
 
-/* resolve budget db id from local id */
-function getBudgetDbId(localId){
-  const b=state.budgets.find(x=>x.id===localId);
-  return b?b._dbId||null:null;
-}
-
 /* ══ BOOT ══ */
 async function boot(){
   showLoading();
   loadLocal();
 
-  // try to fetch from supabase
   try{
-    const[dbBudgets,dbTxs]=await Promise.all([fetchBudgets(),fetchTransactions()]);
+    // fetch budgets from supabase — uuid is the single source of truth
+    const{data:dbBudgets,error:bErr}=await sb.from('budgets').select('*').order('year').order('month');
+    if(bErr)throw bErr;
 
-    if(dbBudgets!==null){
-      // merge: supabase is source of truth for budgets
-      // map db budgets into local format, preserve local activeBudgetId mapping
-      const mapped=dbBudgets.map(b=>({
-        ...b,
-        // keep local numeric id if we have one already (for activeBudgetId matching)
-        id: (state.budgets.find(lb=>lb.name===b.name)?.id) || b.id,
-      }));
-      // ensure activeBudgetId still valid
-      const activeLocalId=state.activeBudgetId;
-      const activeName=state.budgets.find(b=>b.id===activeLocalId)?.name;
+    if(dbBudgets&&dbBudgets.length){
+      const mapped=dbBudgets.map(dbRowToBudget);
+      // preserve activeBudgetId if it's still valid
+      const stillValid=mapped.find(b=>b.id===state.activeBudgetId);
       state.budgets=mapped;
-      if(activeName){
-        const found=mapped.find(b=>b.name===activeName);
-        if(found)state.activeBudgetId=found.id;
+      if(!stillValid){
+        const now2=new Date();
+        const cur=mapped.find(b=>b.month===MONTHS[now2.getMonth()]&&b.year===now2.getFullYear());
+        state.activeBudgetId=cur?cur.id:(mapped[mapped.length-1]?.id||null);
       }
     }
 
-    if(dbTxs!==null){
-      // supabase is source of truth for transactions
-      // map budget_id (uuid) back to local budget id
-      state.transactions=dbTxs.map(t=>{
-        const localBudget=state.budgets.find(b=>b._dbId===t.budgetId||b.id===t.budgetId);
-        return{...t,budgetId:localBudget?localBudget.id:t.budgetId};
-      });
+    // fetch transactions
+    const{data:dbTxs,error:tErr}=await sb.from('transactions').select('*').order('date_str',{ascending:false});
+    if(tErr)throw tErr;
+
+    if(dbTxs){
+      state.transactions=dbTxs.map(t=>({
+        id:t.id,
+        budgetId:t.budget_id,   // already a uuid matching budget.id
+        vendor:t.vendor||'',
+        name:t.description||'',
+        amount:t.amount||0,
+        card:t.card||'amex',
+        pay:t.pay||'pay',
+        flagLabel:t.flag_label||null,
+        dateStr:t.date_str||'',
+      }));
     }
 
     saveLocal();
@@ -991,7 +970,7 @@ async function saveTransaction(){
     // INSERT — optimistic: add locally first, then push to db
     const tempId='tmp_'+Date.now();
     const tx={
-      id:tempId,_dbId:null,
+      id:tempId,
       vendor,name,amount,
       card:activeCard,pay:activePay,flagLabel:activeFlag,
       dateStr:dateVal||todayStr(),
@@ -1002,11 +981,10 @@ async function saveTransaction(){
     saveLocal();
     closeAddModal();renderBudget();renderTransactions();showToast('Transaction added');
     // push to supabase, update id with returned uuid
-    const budgetDbId=getBudgetDbId(state.activeBudgetId);
-    const dbId=await insertTransaction(tx,budgetDbId);
+    const dbId=await insertTransaction(tx,state.activeBudgetId);
     if(dbId){
       const i=state.transactions.findIndex(t=>t.id===tempId);
-      if(i!==-1){state.transactions[i].id=dbId;state.transactions[i]._dbId=dbId;}
+      if(i!==-1){state.transactions[i].id=dbId;}
       saveLocal();
     }
   }
